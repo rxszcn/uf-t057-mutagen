@@ -151,6 +151,12 @@ class Atoms(object):
         while fileobj.tell() + 8 <= end:
             self.atoms.append(Atom(fileobj))
 
+    def findall(self, name):
+        """Find all top-level atoms with the specified name."""
+        for atom in self.atoms:
+            if atom.name == name:
+                yield atom
+
     def path(self, *names):
         """Look up and return the complete path of an atom.
 

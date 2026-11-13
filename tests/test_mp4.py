@@ -6,7 +6,7 @@ from io import BytesIO
 
 import pytest
 
-from tests import TestCase, DATA_DIR, get_temp_copy
+from tests import TestCase, DATA_DIR, get_temp_copy, get_temp_empty
 from mutagen.mp4 import (MP4, MP4Tags, MP4Info, delete, MP4Cover,
                          MP4MetadataError, MP4FreeForm, error, AtomDataType,
                          _item_sort_key, MP4StreamInfoError)
@@ -114,6 +114,11 @@ class TAtoms(TestCase):
 
     def test_children(self):
         self.failUnless(self.atoms.atoms[2].children)
+
+    def test_findall(self):
+        self.failUnlessEqual(
+            [a.name for a in self.atoms.findall(b"moov")], [b"moov"])
+        self.failUnlessEqual(list(self.atoms.findall(b"whee")), [])
 
     def test_no_children(self):
         self.failUnless(self.atoms.atoms[0].children is None)
@@ -943,9 +948,164 @@ class TMP4UpdateParents64Bit(TestCase):
         os.unlink(self.filename)
 
 
+def _render_test_tfhd(base_data_offset, extended=False):
+    # tfhd full atom: version 0, flags=1 (base-data-offset-present),
+    # track_ID=1, then the 64-bit base_data_offset
+    payload = (b"\x00\x00\x00\x01" + struct.pack(">I", 1) +
+               struct.pack(">Q", base_data_offset))
+    if extended:
+        # 64-bit "largesize" atom header
+        return struct.pack(">I4sQ", 1, b"tfhd", 16 + len(payload)) + payload
+    return Atom.render(b"tfhd", payload)
+
+
+def _build_fragmented_mp4(album=u"old", fragments=2, extended_tfhd=False):
+    """Build a minimal fragmented MP4 (moov + moof/mdat pairs) in memory.
+
+    Returns the file contents and the list of mdat sample payloads, which
+    the tfhd base_data_offset values of the moof atoms point to.
+    """
+
+    ilst = Atom.render(b"ilst", Atom.render(b"\xa9alb", Atom.render(
+        b"data", struct.pack(">2I", AtomDataType.UTF8, 0) +
+        album.encode("utf-8"))))
+    moov = Atom.render(b"moov", Atom.render(
+        b"udta", Atom.render(b"meta", b"\x00" * 4 + ilst)))
+    ftyp = Atom.render(b"ftyp", b"M4A \x00\x00\x00\x00M4A ")
+
+    tfhd_length = (16 if extended_tfhd else 8) + 16
+    moof_length = 8 + 8 + tfhd_length
+
+    data = ftyp + moov
+    samples = []
+    for i in range(fragments):
+        sample = bytes([0x31 + i]) * 64
+        base_data_offset = len(data) + moof_length + 8
+        data += Atom.render(b"moof", Atom.render(
+            b"traf", _render_test_tfhd(base_data_offset, extended_tfhd)))
+        data += Atom.render(b"mdat", sample)
+        samples.append(sample)
+    return data, samples
+
+
+class TMP4Fragmented(TestCase):
+    # Saving tags to a fragmented MP4 grows the moov atom, so the
+    # base_data_offset of *every* moof fragment has to be shifted,
+    # no matter if the tfhd atoms use 32-bit or 64-bit headers.
+
+    def setUp(self):
+        self.filename = get_temp_empty(".m4a")
+
+    def tearDown(self):
+        os.unlink(self.filename)
+
+    def _write(self, data):
+        with open(self.filename, "wb") as h:
+            h.write(data)
+
+    def _read(self):
+        with open(self.filename, "rb") as h:
+            return h.read()
+
+    def _load_tags(self):
+        with open(self.filename, "rb") as h:
+            return MP4Tags(Atoms(h), h)
+
+    def _read_tfhd_offsets(self):
+        offsets = []
+        with open(self.filename, "rb") as h:
+            atoms = Atoms(h)
+            for moof in atoms.findall(b"moof"):
+                for tfhd in moof.findall(b"tfhd", True):
+                    h.seek(tfhd._dataoffset)
+                    payload = h.read(tfhd.datalength)
+                    flags = cdata.uint_be(b"\x00" + payload[1:4])
+                    self.failUnless(flags & 1)
+                    offsets.append(cdata.ulonglong_be(payload[8:16]))
+        return offsets
+
+    def _read_samples(self, offsets):
+        samples = []
+        with open(self.filename, "rb") as h:
+            for offset in offsets:
+                h.seek(offset)
+                samples.append(h.read(64))
+        return samples
+
+    def test_all_moof_offsets_updated_on_grow(self):
+        for extended in (False, True):
+            data, samples = _build_fragmented_mp4(
+                fragments=3, extended_tfhd=extended)
+            self._write(data)
+            old_offsets = self._read_tfhd_offsets()
+            self.failUnlessEqual(len(old_offsets), 3)
+
+            tags = self._load_tags()
+            tags["\xa9alb"] = [u"a much longer album title than before"]
+            tags.save(self.filename, padding=lambda x: 0)
+
+            delta = os.path.getsize(self.filename) - len(data)
+            self.failUnless(delta > 0)
+            new_offsets = self._read_tfhd_offsets()
+            self.failUnlessEqual(
+                new_offsets, [o + delta for o in old_offsets])
+            self.failUnlessEqual(self._read_samples(new_offsets), samples)
+
+            audio = MP4(self.filename)
+            self.failUnlessEqual(
+                audio.tags["\xa9alb"],
+                [u"a much longer album title than before"])
+
+    def test_all_moof_offsets_updated_on_shrink(self):
+        for extended in (False, True):
+            data, samples = _build_fragmented_mp4(
+                album=u"a pretty long album title", fragments=2,
+                extended_tfhd=extended)
+            self._write(data)
+            old_offsets = self._read_tfhd_offsets()
+
+            tags = self._load_tags()
+            tags["\xa9alb"] = [u"x"]
+            tags.save(self.filename, padding=lambda x: 0)
+
+            delta = len(data) - os.path.getsize(self.filename)
+            self.failUnless(delta > 0)
+            new_offsets = self._read_tfhd_offsets()
+            self.failUnlessEqual(
+                new_offsets, [o - delta for o in old_offsets])
+            self.failUnlessEqual(self._read_samples(new_offsets), samples)
+
+    def test_same_length_tag_keeps_offsets(self):
+        for extended in (False, True):
+            data, samples = _build_fragmented_mp4(
+                album=u"old", extended_tfhd=extended)
+            self._write(data)
+            self._load_tags().save(self.filename, padding=lambda x: 512)
+            offsets = self._read_tfhd_offsets()
+
+            tags = self._load_tags()
+            tags["\xa9alb"] = [u"new"]  # same length as "old"
+            tags.save(self.filename)
+
+            self.failUnlessEqual(self._read_tfhd_offsets(), offsets)
+            self.failUnlessEqual(self._read_samples(offsets), samples)
+            self.failUnlessEqual(self._load_tags()["\xa9alb"], [u"new"])
+
+    def test_unchanged_tags_no_byte_changes(self):
+        for extended in (False, True):
+            data, _ = _build_fragmented_mp4(extended_tfhd=extended)
+            self._write(data)
+            # create some padding so the second save doesn't resize
+            self._load_tags().save(self.filename, padding=lambda x: 512)
+            before = self._read()
+
+            self._load_tags().save(self.filename)
+
+            self.failUnlessEqual(self._read(), before)
+
+
 class TMP4ALAC(TestCase):
     original = os.path.join(DATA_DIR, "alac.m4a")
-
     def setUp(self):
         self.audio = MP4(self.original)
 

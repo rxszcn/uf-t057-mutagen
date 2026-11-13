@@ -516,13 +516,14 @@ class MP4Tags(DictProxy, Tags):
         """Update offset table in the specified atom."""
         if atom.offset > offset:
             atom.offset += delta
-        fileobj.seek(atom.offset + 12)
-        data = fileobj.read(atom.length - 12)
+            atom._dataoffset += delta
+        fileobj.seek(atom._dataoffset + 4)
+        data = fileobj.read(atom.datalength - 4)
         fmt = fmt % cdata.uint_be(data[:4])
         try:
             offsets = struct.unpack(fmt, data[4:])
             offsets = [o + (0, delta)[offset < o] for o in offsets]
-            fileobj.seek(atom.offset + 16)
+            fileobj.seek(atom._dataoffset + 8)
             fileobj.write(struct.pack(fmt, *offsets))
         except struct.error:
             raise MP4MetadataError("wrong offset inside %r" % atom.name)
@@ -530,14 +531,15 @@ class MP4Tags(DictProxy, Tags):
     def __update_tfhd(self, fileobj, atom, delta, offset):
         if atom.offset > offset:
             atom.offset += delta
-        fileobj.seek(atom.offset + 9)
-        data = fileobj.read(atom.length - 9)
+            atom._dataoffset += delta
+        fileobj.seek(atom._dataoffset + 1)
+        data = fileobj.read(atom.datalength - 1)
         flags = cdata.uint_be(b"\x00" + data[:3])
         if flags & 1:
             o = cdata.ulonglong_be(data[7:15])
             if o > offset:
                 o += delta
-            fileobj.seek(atom.offset + 16)
+            fileobj.seek(atom._dataoffset + 8)
             fileobj.write(cdata.to_ulonglong_be(o))
 
     def __update_offsets(self, fileobj, atoms, delta, offset):
@@ -549,11 +551,9 @@ class MP4Tags(DictProxy, Tags):
             self.__update_offset_table(fileobj, ">%dI", atom, delta, offset)
         for atom in moov.findall(b'co64', True):
             self.__update_offset_table(fileobj, ">%dQ", atom, delta, offset)
-        try:
-            for atom in atoms[b"moof"].findall(b'tfhd', True):
+        for moof in atoms.findall(b"moof"):
+            for atom in moof.findall(b'tfhd', True):
                 self.__update_tfhd(fileobj, atom, delta, offset)
-        except KeyError:
-            pass
 
     def __parse_data(self, atom, data):
         pos = 0
